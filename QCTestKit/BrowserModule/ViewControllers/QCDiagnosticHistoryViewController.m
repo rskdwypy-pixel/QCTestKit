@@ -6,28 +6,82 @@
 //
 
 #import "QCDiagnosticHistoryViewController.h"
-#import "QCWebDiagnosticViewController.h"
-#import <WebKit/WebKit.h>
+#import "QCNetworkCapture.h"
+#import "QCNetworkRequestDetailViewController.h"
 
-static NSString * const kQCBrowserDiagnosticHistoryKey = @"QCBrowserDiagnosticHistory";
+@interface QCNetworkPacketDisplay : NSObject
+@property(nonatomic, strong) QCNetworkPacket *packet;
+@property(nonatomic, strong) NSString *domain;
+@property(nonatomic, assign) QCNetworkRequestType type;
+@end
+
+@implementation QCNetworkPacketDisplay
+@end
 
 @interface QCDiagnosticHistoryViewController () <UITableViewDelegate, UITableViewDataSource>
 
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) NSArray *historyItems;
+@property(nonatomic, strong) QCNetworkSession *session;
+@property(nonatomic, strong) UITableView *tableView;
+@property(nonatomic, strong) UISegmentedControl *filterSegment;  // 过滤：全部/成功/失败
+@property(nonatomic, strong) NSMutableArray<QCNetworkPacketDisplay *> *filteredPackets;
+
+// 统计标签
+@property(nonatomic, strong) UILabel *summaryLabel;
 
 @end
 
 @implementation QCDiagnosticHistoryViewController
 
+- (instancetype)initWithSession:(QCNetworkSession *)session {
+    self = [super init];
+    if (self) {
+        _session = session;
+        _filteredPackets = [NSMutableArray array];
+    }
+    return self;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
-    [self setupNavigationWithTitle:@"📊 诊断历史"];
+    [self setupNavigationWithTitle:@"页面详情"];
+    [self setupFilterSegment];
+    [self setupSummaryLabel];
     [self setupTableView];
-    [self setupToolbar];
+    [self filterPackets];
+}
 
-    // 加载历史记录
-    [self loadHistory];
+- (void)setupFilterSegment {
+    self.filterSegment = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"成功", @"失败", @"资源"]];
+    self.filterSegment.selectedSegmentIndex = 0;
+    [self.filterSegment addTarget:self action:@selector(filterChanged:) forControlEvents:UIControlEventValueChanged];
+    self.filterSegment.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.filterSegment];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.filterSegment.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
+        [self.filterSegment.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [self.filterSegment.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [self.filterSegment.heightAnchor constraintEqualToConstant:32]
+    ]];
+}
+
+- (void)setupSummaryLabel {
+    self.summaryLabel = [[UILabel alloc] init];
+    self.summaryLabel.font = [UIFont systemFontOfSize:12];
+    self.summaryLabel.textColor = [UIColor colorWithRed:0.5 green:0.5 blue:0.5 alpha:1.0];
+    self.summaryLabel.textAlignment = NSTextAlignmentCenter;
+    self.summaryLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.summaryLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.summaryLabel.topAnchor constraintEqualToAnchor:self.filterSegment.bottomAnchor constant:8],
+        [self.summaryLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [self.summaryLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [self.summaryLabel.heightAnchor constraintEqualToConstant:20]
+    ]];
+
+    self.summaryLabel.text = [NSString stringWithFormat:@"URL: %@ | 总请求数: %ld",
+                              self.session.mainUrl, (long)self.session.totalRequests];
 }
 
 - (void)setupTableView {
@@ -35,231 +89,127 @@ static NSString * const kQCBrowserDiagnosticHistoryKey = @"QCBrowserDiagnosticHi
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
     self.tableView.backgroundColor = [UIColor colorWithRed:0.97 green:0.97 blue:0.95 alpha:1.0];
-    self.tableView.separatorColor = [UIColor colorWithRed:0.85 green:0.85 blue:0.85 alpha:1.0];
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.tableView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.tableView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [self.tableView.topAnchor constraintEqualToAnchor:self.summaryLabel.bottomAnchor constant:8],
         [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor]
     ]];
 }
 
-- (void)setupToolbar {
-    UIBarButtonItem *clearButton = [[UIBarButtonItem alloc] initWithTitle:@"🗑️ 清空"
-                                                                   style:UIBarButtonItemStylePlain
-                                                                  target:self
-                                                                  action:@selector(clearHistory)];
-    UIBarButtonItem *exportButton = [[UIBarButtonItem alloc] initWithTitle:@"📤 导出全部"
-                                                                    style:UIBarButtonItemStylePlain
-                                                                   target:self
-                                                                   action:@selector(exportAll)];
-    UIBarButtonItem *space = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
-                                                                            target:nil
-                                                                            action:nil];
-
-    self.toolbarItems = @[clearButton, space, exportButton];
-    self.navigationController.toolbarHidden = NO;
+- (void)filterChanged:(UISegmentedControl *)sender {
+    [self filterPackets];
 }
 
-- (void)loadHistory {
-    NSData *jsonData = [[NSUserDefaults standardUserDefaults] objectForKey:kQCBrowserDiagnosticHistoryKey];
-    NSLog(@"[QCTestKit] 📖 读取诊断历史，jsonData: %@", jsonData ? @"存在" : @"不存在");
+- (void)filterPackets {
+    [self.filteredPackets removeAllObjects];
 
-    if (jsonData) {
-        NSError *error = nil;
-        self.historyItems = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&error];
-        if (error) {
-            NSLog(@"[QCTestKit] ❌ JSON解码失败: %@", error);
-            // 解码失败，清除损坏的数据
-            NSLog(@"[QCTestKit] 🗑️ 清除损坏的历史数据");
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:kQCBrowserDiagnosticHistoryKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            self.historyItems = @[];
-        } else {
-            NSLog(@"[QCTestKit] 📊 解码后记录数: %lu", (unsigned long)self.historyItems.count);
+    NSInteger filterIndex = self.filterSegment.selectedSegmentIndex;
+
+    for (QCNetworkPacket *packet in self.session.packets) {
+        BOOL shouldInclude = NO;
+
+        switch (filterIndex) {
+            case 0:  // 全部
+                shouldInclude = YES;
+                break;
+            case 1:  // 成功
+                shouldInclude = (packet.statusCode >= 200 && packet.statusCode < 400);
+                break;
+            case 2:  // 失败
+                shouldInclude = (packet.statusCode >= 400 || packet.errorMessage.length > 0);
+                break;
+            case 3:  // 资源（排除主文档）
+                shouldInclude = (packet.type != QCNetworkRequestTypeMainDocument);
+                break;
         }
-    } else {
-        self.historyItems = @[];
-    }
 
-    // 确保 historyItems 不为 nil
-    if (!self.historyItems) {
-        self.historyItems = @[];
-    }
-
-    if (self.historyItems.count == 0) {
-        // 显示空状态
-        [self showEmptyState];
-    } else {
-        self.tableView.backgroundView = nil;
-        self.tableView.separatorStyle = UITableViewCellSeparatorStyleSingleLine;
-        [self.tableView reloadData];
-    }
-}
-
-- (void)showEmptyState {
-    UILabel *emptyLabel = [[UILabel alloc] initWithFrame:self.tableView.bounds];
-    emptyLabel.text = @"📭\n\n暂无诊断记录\n\n访问网页后会自动保存诊断数据";
-    emptyLabel.textAlignment = NSTextAlignmentCenter;
-    emptyLabel.textColor = [UIColor colorWithRed:0.5 green:0.5 blue:0.5 alpha:1.0];
-    emptyLabel.numberOfLines = 0;
-    emptyLabel.font = [UIFont systemFontOfSize:16];
-    emptyLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.tableView.backgroundView = emptyLabel;
-    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
-}
-
-- (void)clearHistory {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空历史"
-                                                                   message:@"确定要删除所有诊断记录吗？"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kQCBrowserDiagnosticHistoryKey];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        NSLog(@"[QCTestKit] 🗑️ 诊断历史已清空");
-        self.historyItems = @[];
-        [self.tableView reloadData];
-        [self showEmptyState];
-    }]];
-
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)exportAll {
-    if (self.historyItems.count == 0) {
-        [self showMessage:@"没有可导出的记录"];
-        return;
-    }
-
-    NSMutableString *report = [NSMutableString string];
-    [report appendString:@"# QCTestKit 诊断历史报告\n"];
-    [report appendString:[NSString stringWithFormat:@"导出时间: %@\n", [self formatDate:[NSDate date]]]];
-    [report appendString:[NSString stringWithFormat:@"记录数量: %lu\n\n", (unsigned long)self.historyItems.count]];
-
-    NSInteger index = 0;
-    for (NSDictionary *item in self.historyItems) {
-        index++;
-        [report appendString:[NSString stringWithFormat:@"## 记录 #%ld\n", (long)index]];
-        [report appendString:[NSString stringWithFormat:@"页面: %@\n", item[@"title"] ?: @"Unknown"]];
-        [report appendString:[NSString stringWithFormat:@"URL: %@\n", item[@"url"] ?: @""]];
-        [report appendString:[NSString stringWithFormat:@"访问时间: %@\n", [self formatDate:item[@"savedAt"]]]];
-
-        NSDictionary *metrics = item;
-        if (metrics[@"totalLoadTime"]) {
-            [report appendString:[NSString stringWithFormat:@"加载时间: %.0f ms\n", [metrics[@"totalLoadTime"] doubleValue]]];
+        if (shouldInclude) {
+            QCNetworkPacketDisplay *display = [[QCNetworkPacketDisplay alloc] init];
+            display.packet = packet;
+            display.type = packet.type;
+            display.domain = [self extractDomain:packet.url];
+            [self.filteredPackets addObject:display];
         }
-        if (metrics[@"resourceCount"]) {
-            [report appendString:[NSString stringWithFormat:@"资源数: %@\n", metrics[@"resourceCount"]]];
-        }
-        if (metrics[@"jsErrorCount"]) {
-            [report appendString:[NSString stringWithFormat:@"JS错误: %@\n", metrics[@"jsErrorCount"]]];
-        }
-        [report appendString:@"\n"];
     }
 
-    // 输出到日志
-    NSLog(@"╔══════════════════════════════════════════════════════════════════════════════");
-    NSLog(@"[QCTestKit] 📊 ========== 历史报告开始 ==========");
-    NSLog(@"%@", report);
-    NSLog(@"[QCTestKit] 📊 ========== 历史报告结束 ==========");
-    NSLog(@"╚══════════════════════════════════════════════════════════════════════════════");
+    // 按类型和域名排序
+    [self.filteredPackets sortUsingComparator:^NSComparisonResult(QCNetworkPacketDisplay *obj1, QCNetworkPacketDisplay *obj2) {
+        // 先按类型分组
+        if (obj1.type != obj2.type) {
+            return obj1.type > obj2.type ? NSOrderedDescending : NSOrderedAscending;
+        }
+        // 同类型按域名排序
+        return [obj1.domain compare:obj2.domain];
+    }];
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"导出完成"
-                                                                   message:[NSString stringWithFormat:@"已导出 %lu 条记录到日志", (unsigned long)self.historyItems.count]
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    [self.tableView reloadData];
 }
 
-- (NSString *)formatDate:(id)date {
-    if (!date) return @"";
-
-    // 如果是字符串，直接返回
-    if ([date isKindOfClass:[NSString class]]) {
-        return date;
-    }
-
-    // 如果是 NSDate，格式化
-    if ([date isKindOfClass:[NSDate class]]) {
-        static NSDateFormatter *formatter = nil;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            formatter = [[NSDateFormatter alloc] init];
-            formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-        });
-        return [formatter stringFromDate:date];
-    }
-
-    return @"";
-}
-
-- (NSString *)formatDuration:(NSNumber *)milliseconds {
-    if (!milliseconds) return @"--";
-    double ms = [milliseconds doubleValue];
-    if (ms < 1000) {
-        return [NSString stringWithFormat:@"%.0f ms", ms];
-    } else {
-        return [NSString stringWithFormat:@"%.2f s", ms / 1000.0];
-    }
+- (NSString *)extractDomain:(NSString *)url {
+    if (!url) return @"";
+    NSURL *urlObj = [NSURL URLWithString:url];
+    return urlObj.host ?: @"";
 }
 
 #pragma mark - UITableView DataSource
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.historyItems.count;
+    return self.filteredPackets.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cellId = @"HistoryCell";
+    static NSString *cellId = @"PacketCell";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellId];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cellId];
     }
 
-    NSDictionary *item = self.historyItems[indexPath.row];
-    NSString *url = item[@"url"] ?: @"";
-    NSString *title = item[@"title"] ?: @"Unknown";
-    NSDate *savedAt = item[@"savedAt"];
-    NSNumber *loadTime = item[@"totalLoadTime"];
-    NSNumber *errorCount = item[@"jsErrorCount"];
+    QCNetworkPacketDisplay *display = self.filteredPackets[indexPath.row];
+    QCNetworkPacket *packet = display.packet;
 
-    cell.backgroundColor = [UIColor whiteColor];
-    cell.textLabel.textColor = [UIColor colorWithRed:0.15 green:0.15 blue:0.2 alpha:1.0];
-    cell.textLabel.font = [UIFont boldSystemFontOfSize:14];
+    // URL处理：显示路径部分
+    NSString *displayUrl = packet.url;
+    NSURL *urlObj = [NSURL URLWithString:packet.url];
+    if (urlObj.path && urlObj.path.length > 0) {
+        if (urlObj.query) {
+            displayUrl = [NSString stringWithFormat:@"%@?%@", urlObj.path, urlObj.query];
+        } else {
+            displayUrl = urlObj.path;
+        }
+    }
+    if (displayUrl.length > 60) {
+        displayUrl = [NSString stringWithFormat:@"...%@", [displayUrl substringFromIndex:displayUrl.length - 57]];
+    }
+
+    cell.textLabel.text = displayUrl;
+    cell.textLabel.font = [UIFont systemFontOfSize:13];
     cell.textLabel.numberOfLines = 2;
 
-    cell.detailTextLabel.textColor = [UIColor colorWithRed:0.5 green:0.5 blue:0.5 alpha:1.0];
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+    // 类型图标
+    NSString *typeIcon = [self typeIcon:packet.type];
+    NSString *methodBadge = [self methodBadge:packet.method];
+    NSString *statusIcon = (packet.statusCode >= 200 && packet.statusCode < 300) ? @"✅" :
+                           (packet.statusCode >= 400) ? @"❌" : @"⚠️";
 
-    // 标题和URL
-    cell.textLabel.text = title;
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ %@ %@ %ld (%.0fms) | %@",
+                                  typeIcon, methodBadge, statusIcon,
+                                  (long)packet.statusCode, [packet.duration doubleValue],
+                                  [self formatBytes:[packet.responseBodySize integerValue]]];
 
-    // 副标题：时间、加载时长、错误数
-    NSMutableString *subtitle = [NSMutableString string];
-    [subtitle appendString:[self formatDate:savedAt]];
-
-    if (loadTime) {
-        [subtitle appendFormat:@" | ⏱ %@", [self formatDuration:loadTime]];
-    }
-
-    if (errorCount && [errorCount integerValue] > 0) {
-        [subtitle appendFormat:@" | ❌ %@", errorCount];
-    }
-
-    cell.detailTextLabel.text = subtitle;
-
-    // 根据错误数量设置状态颜色
-    if (errorCount && [errorCount integerValue] > 0) {
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1.0];
+    // 根据状态设置颜色
+    if (packet.statusCode >= 200 && packet.statusCode < 300) {
+        cell.detailTextLabel.textColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.2 alpha:1.0];
+    } else if (packet.statusCode >= 400) {
+        cell.detailTextLabel.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
     } else {
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.detailTextLabel.textColor = [UIColor colorWithRed:0.0 green:0.4 blue:0.8 alpha:1.0];
     }
+
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 
     return cell;
 }
@@ -269,8 +219,8 @@ static NSString * const kQCBrowserDiagnosticHistoryKey = @"QCBrowserDiagnosticHi
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    NSDictionary *item = self.historyItems[indexPath.row];
-    QCWebDiagnosticViewController *detailVC = [[QCWebDiagnosticViewController alloc] initWithDiagnosticData:item];
+    QCNetworkPacketDisplay *display = self.filteredPackets[indexPath.row];
+    QCNetworkRequestDetailViewController *detailVC = [[QCNetworkRequestDetailViewController alloc] initWithPacket:display.packet];
     [self.navigationController pushViewController:detailVC animated:YES];
 }
 
@@ -278,28 +228,66 @@ static NSString * const kQCBrowserDiagnosticHistoryKey = @"QCBrowserDiagnosticHi
     return 70;
 }
 
-// 支持删除
-- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (editingStyle == UITableViewCellEditingStyleDelete) {
-        NSMutableArray *mutableHistory = [self.historyItems mutableCopy];
-        [mutableHistory removeObjectAtIndex:indexPath.row];
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return @"请求列表";
+}
 
-        // 使用 JSON 保存更新后的历史
-        NSError *error = nil;
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableHistory options:0 error:&error];
-        if (!error) {
-            [[NSUserDefaults standardUserDefaults] setObject:jsonData forKey:kQCBrowserDiagnosticHistoryKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }
+#pragma mark - Helper Methods
 
-        self.historyItems = mutableHistory;
-        [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+- (NSString *)formatBytes:(NSInteger)bytes {
+    if (bytes < 1024) {
+        return [NSString stringWithFormat:@"%ld B", (long)bytes];
+    } else if (bytes < 1024 * 1024) {
+        return [NSString stringWithFormat:@"%.1f KB", bytes / 1024.0];
+    } else {
+        return [NSString stringWithFormat:@"%.2f MB", bytes / (1024.0 * 1024.0)];
+    }
+}
 
-        NSLog(@"[QCTestKit] 🗑️ 已删除一条诊断记录");
+- (NSString *)formatDate:(NSDate *)date {
+    static NSDateFormatter *formatter = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    });
+    return [formatter stringFromDate:date];
+}
 
-        if (self.historyItems.count == 0) {
-            [self showEmptyState];
-        }
+- (NSString *)methodBadge:(NSString *)method {
+    if ([method isEqualToString:@"GET"]) return @"🟢 GET";
+    if ([method isEqualToString:@"POST"]) return @"🔵 POST";
+    if ([method isEqualToString:@"PUT"]) return @"🟡 PUT";
+    if ([method isEqualToString:@"DELETE"]) return @"🔴 DELETE";
+    if ([method isEqualToString:@"PATCH"]) return @"🟣 PATCH";
+    return [NSString stringWithFormat:@"⚪️ %@", method];
+}
+
+- (NSString *)typeName:(QCNetworkRequestType)type {
+    switch (type) {
+        case QCNetworkRequestTypeMainDocument: return @"主文档";
+        case QCNetworkRequestTypeFetch: return @"Fetch";
+        case QCNetworkRequestTypeXHR: return @"XHR";
+        case QCNetworkRequestTypeScript: return @"脚本";
+        case QCNetworkRequestTypeStylesheet: return @"样式";
+        case QCNetworkRequestTypeImage: return @"图片";
+        case QCNetworkRequestTypeFont: return @"字体";
+        case QCNetworkRequestTypeMedia: return @"媒体";
+        default: return @"其他";
+    }
+}
+
+- (NSString *)typeIcon:(QCNetworkRequestType)type {
+    switch (type) {
+        case QCNetworkRequestTypeMainDocument: return @"📄";
+        case QCNetworkRequestTypeFetch: return @"🔄";
+        case QCNetworkRequestTypeXHR: return @"📡";
+        case QCNetworkRequestTypeScript: return @"📜";
+        case QCNetworkRequestTypeStylesheet: return @"🎨";
+        case QCNetworkRequestTypeImage: return @"🖼️";
+        case QCNetworkRequestTypeFont: return @"🔤";
+        case QCNetworkRequestTypeMedia: return @"🎬";
+        default: return @"📎";
     }
 }
 

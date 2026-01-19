@@ -7,16 +7,13 @@
 
 #import "QCBrowserViewController.h"
 #import "QCButtonStyler.h"
-#import "QCDiagnosticHistoryViewController.h"
 #import "QCWebDiagnosticViewController.h"
+#import "QCNetworkCapture.h"
 #import <WebKit/WebKit.h>
 
 // UserDefaults keys
 static NSString *const kQCBrowserClearCacheKey = @"QCBrowserClearCache";
 static NSString *const kQCBrowserUseWKKey = @"QCBrowserUseWK";
-static NSString *const kQCBrowserDiagnosticHistoryKey =
-    @"QCBrowserDiagnosticHistory";
-static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条记录
 
 @interface QCBrowserViewController () <WKNavigationDelegate, WKUIDelegate,
                                        UISearchBarDelegate,
@@ -32,7 +29,6 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 @property(nonatomic, strong) UIBarButtonItem *backButton;
 @property(nonatomic, strong) UIBarButtonItem *forwardButton;
 @property(nonatomic, strong) UIBarButtonItem *refreshButton;
-@property(nonatomic, strong) UIBarButtonItem *clearCacheButton;
 @property(nonatomic, strong) UIBarButtonItem *diagnosticButton;
 @property(nonatomic, strong) UIProgressView *progressView;
 @property(nonatomic, strong) UILabel *progressLabel;
@@ -47,30 +43,26 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 @property(nonatomic, assign) BOOL useWKWebView;
 @property(nonatomic, assign) BOOL clearCacheOnStart;
 
-// Network logging
-@property(nonatomic, strong) NSMutableString *currentRequestLog;
-@property(nonatomic, strong) NSDate *currentRequestStartTime;
+// 网络抓包
+@property(nonatomic, strong) QCNetworkCaptureManager *captureManager;
+@property(nonatomic, strong) QCNetworkSession *currentSession;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, QCNetworkPacket *> *pendingPackets;
 
-// Diagnostics
-@property(nonatomic, strong)
-    NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *>
-        *resourceRequests;
-@property(nonatomic, strong) NSMutableArray<NSDictionary *> *jsErrors;
-@property(nonatomic, strong) NSMutableArray<NSDictionary *> *consoleLogs;
-@property(nonatomic, strong)
-    NSMutableDictionary<NSString *, NSNumber *> *timingMetrics;
-@property(nonatomic, strong) NSDate *pageLoadStartTime;
-@property(nonatomic, assign) long long totalBytesReceived;
-@property(nonatomic, assign) NSInteger failedResourceCount;
+// 日志属性（用于调试输出）
+@property(nonatomic, strong) NSDate *currentRequestStartTime;
+@property(nonatomic, strong) NSMutableString *currentRequestLog;
 
 // 加载状态跟踪
 @property(nonatomic, assign) float lastProgress;
 @property(nonatomic, assign) NSInteger progressJumpCount; // 进度突变次数
 @property(nonatomic, assign) BOOL isLoadingFromCache;     // 是否从缓存加载
-@property(nonatomic, assign) BOOL loadFailed;             // 加载是否失败
-@property(nonatomic, strong) NSError *loadError;          // 加载错误信息
 @property(nonatomic, strong)
     NSMutableArray<NSNumber *> *progressHistory; // 进度历史记录
+@property(nonatomic, assign) BOOL isLoadingComplete; // 本次加载是否已完成
+
+// 导航跟踪（用于抓包会话管理）
+@property(nonatomic, strong) NSString *lastNavigatedURL; // 上次导航的URL
+@property(nonatomic, assign) BOOL isPageLoading; // 页面是否正在加载中
 
 @end
 
@@ -80,20 +72,19 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   [super viewDidLoad];
   self.history = [NSMutableArray array];
 
-  // 初始化诊断数据
-  self.resourceRequests = [NSMutableDictionary dictionary];
-  self.jsErrors = [NSMutableArray array];
-  self.consoleLogs = [NSMutableArray array];
-  self.timingMetrics = [NSMutableDictionary dictionary];
-  self.totalBytesReceived = 0;
-  self.failedResourceCount = 0;
+  // 初始化网络抓包管理器
+  self.captureManager = [QCNetworkCaptureManager sharedManager];
+  self.pendingPackets = [NSMutableDictionary dictionary];
+
+  // 清空之前的抓包数据
+  [self.captureManager clearAll];
 
   // 初始化加载状态跟踪
   self.lastProgress = 0;
   self.progressJumpCount = 0;
   self.isLoadingFromCache = NO;
-  self.loadFailed = NO;
   self.progressHistory = [NSMutableArray array];
+  self.isLoadingComplete = NO;
 
   // 先读取设置
   [self loadSettings];
@@ -107,22 +98,16 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   [self setupToolbar];
   [self setupProgressView];
 
-  // 启动时清除诊断历史
-  [[NSUserDefaults standardUserDefaults]
-      removeObjectForKey:kQCBrowserDiagnosticHistoryKey];
-  [[NSUserDefaults standardUserDefaults] synchronize];
-  NSLog(@"[QCTestKit] 🗑️ 启动时已清除诊断历史");
-
   // 根据设置决定是否清除缓存
   if (self.clearCacheOnStart) {
     [self clearCache];
   }
 
-  // 默认加载百度
+  // 默认加载 adidas
   dispatch_after(
       dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
-        [self loadURLString:@"https://www.baidu.com"];
+        [self loadURLString:@"https://www.adidas.com"];
       });
 }
 
@@ -152,15 +137,7 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 #pragma mark - Setup UI
 
 - (void)setupNavigationSwitches {
-  // 清除缓存设置按钮 - 显示当前状态（右侧）
-  NSString *clearCacheTitle = self.clearCacheOnStart ? @"✓ 清缓存" : @"清缓存";
-  self.clearCacheSettingButton =
-      [[UIBarButtonItem alloc] initWithTitle:clearCacheTitle
-                                       style:UIBarButtonItemStylePlain
-                                      target:self
-                                      action:@selector(toggleClearCache)];
-
-  // WebView类型按钮 - 显示当前类型（左侧）
+  // WebView类型按钮 - 显示当前类型
   NSString *webViewTypeTitle = self.useWKWebView ? @"WK" : @"UI";
   self.webViewTypeButton =
       [[UIBarButtonItem alloc] initWithTitle:webViewTypeTitle
@@ -168,8 +145,24 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
                                       target:self
                                       action:@selector(toggleWebViewType)];
 
-  self.navigationItem.leftBarButtonItem = self.webViewTypeButton;
-  self.navigationItem.rightBarButtonItem = self.clearCacheSettingButton;
+  // 清除缓存设置按钮 - 显示当前状态
+  NSString *clearCacheTitle = self.clearCacheOnStart ? @"✓ 清缓存" : @"清缓存";
+  self.clearCacheSettingButton =
+      [[UIBarButtonItem alloc] initWithTitle:clearCacheTitle
+                                       style:UIBarButtonItemStylePlain
+                                      target:self
+                                      action:@selector(toggleClearCache)];
+
+  // 两个按钮都放在左侧
+  self.navigationItem.leftBarButtonItems = @[self.clearCacheSettingButton, self.webViewTypeButton];
+
+  // 右上角网络分析按钮
+  self.diagnosticButton =
+      [[UIBarButtonItem alloc] initWithTitle:@"📊 网络分析"
+                                       style:UIBarButtonItemStylePlain
+                                      target:self
+                                      action:@selector(showNetworkAnalysis)];
+  self.navigationItem.rightBarButtonItem = self.diagnosticButton;
 }
 
 - (void)toggleClearCache {
@@ -311,11 +304,20 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 }
 
 - (void)createCurrentWebView {
-  // 移除旧的 web view
+  // 移除旧的 web view 和 script message handlers
   if (self.webView) {
     [self.webView removeObserver:self forKeyPath:@"estimatedProgress"];
     [self.webView removeObserver:self forKeyPath:@"canGoBack"];
     [self.webView removeObserver:self forKeyPath:@"canGoForward"];
+
+    // 重要：移除旧的 script message handlers，避免重复注册
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"networkLog"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"userOperation"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"jsError"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"consoleLog"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"performanceData"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"resourceTiming"];
+
     [self.webView removeFromSuperview];
     self.webView = nil;
   }
@@ -529,6 +531,159 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   [config.userContentController addScriptMessageHandler:self
                                                    name:@"networkLog"];
 
+  // 注入用户操作捕获脚本
+  NSString *operationCaptureScript =
+      @"(function() {"
+      // 操作追踪
+      @"var operationId = Date.now();"
+      @"var operationCount = 0;"
+      @""
+      // 格式化元素信息
+      @"function getElementInfo(element) {"
+      @"    if (!element) return 'unknown';"
+      @"    var tag = element.tagName ? element.tagName.toLowerCase() : 'unknown';"
+      @"    var id = element.id ? '#' + element.id : '';;"
+      @"    var classes = element.className ? '.' + element.className.split(' ').join('.') : '';"
+      @"    var text = element.textContent && element.textContent.length > 0 && element.textContent.length < 30"
+      @"        ? ' (' + element.textContent.trim().substring(0, 20) + ')' : '';"
+      @"    return tag + id + classes + text;"
+      @"}"
+      @""
+      // 发送操作消息
+      @"function sendOperation(type, name, element) {"
+      @"    var op = {"
+      @"        type: type,"
+      @"        name: name,"
+      @"        element: getElementInfo(element),"
+      @"        url: window.location.href,"
+      @"        timestamp: new Date().toISOString()"
+      @"    };"
+      @"    window.webkit.messageHandlers.userOperation.postMessage(op);"
+      @"}"
+      @""
+      // 监听点击事件
+      @"document.addEventListener('click', function(e) {"
+      @"    var target = e.target;"
+      @"    var tagName = target.tagName ? target.tagName.toLowerCase() : '';"
+      @"    var opName = '点击 ' + getElementInfo(target);"
+      @"    "
+      @"    // 判断特殊操作类型"
+      @"    if (tagName === 'a' || target.closest('a')) {"
+      @"        var link = target.closest('a');"
+      @"        var href = link.href ? link.href.substring(0, 100) : '';"
+      @"        opName = '点击链接: ' + href;"
+      @"    } else if (tagName === 'button' || target.closest('button')) {"
+      @"        var btnText = target.textContent || target.value || '';"
+      @"        opName = '点击按钮' + (btnText ? ': ' + btnText.substring(0, 20) : '');"
+      @"    } else if (tagName === 'input') {"
+      @"        var inputType = target.type || 'text';"
+      @"        if (inputType === 'submit' || inputType === 'button') {"
+      @"            opName = '点击提交按钮';"
+      @"        }"
+      @"    }"
+      @"    "
+      @"    sendOperation('click', opName, target);"
+      @"}, true);"
+      @""
+      // 监听表单提交
+      @"document.addEventListener('submit', function(e) {"
+      @"    var target = e.target;"
+      @"    var action = target.action ? target.action.substring(0, 100) : window.location.href;"
+      @"    var opName = '提交表单: ' + action;"
+      @"    sendOperation('submit', opName, target);"
+      @"}, true);"
+      @""
+      // 监听输入变化（防抖）
+      @"var inputTimeout = null;"
+      @"document.addEventListener('input', function(e) {"
+      @"    clearTimeout(inputTimeout);"
+      @"    inputTimeout = setTimeout(function() {"
+      @"        var target = e.target;"
+      @"        var name = target.name || target.id || target.placeholder || 'input';"
+      @"        var value = target.value ? target.value.substring(0, 50) : '';"
+      @"        sendOperation('input', '输入: ' + name + (value ? ' = ' + value : ''), target);"
+      @"    }, 500);"
+      @"}, true);"
+      @""
+      // 监听滚动（节流）
+      @"var lastScrollTime = 0;"
+      @"document.addEventListener('scroll', function(e) {"
+      @"    var now = Date.now();"
+      @"    if (now - lastScrollTime > 2000) {"
+      @"        var scrollTop = window.pageYOffset || document.documentElement.scrollTop;"
+      @"        var docHeight = document.documentElement.scrollHeight - window.innerHeight;"
+      @"        var percent = docHeight > 0 ? Math.round((scrollTop / docHeight) * 100) : 0;"
+      @"        sendOperation('scroll', '滚动到 ' + percent + '%', e.target);"
+      @"        lastScrollTime = now;"
+      @"    }"
+      @"}, true);"
+      @""
+      // 监听搜索操作
+      @"document.addEventListener('keydown', function(e) {"
+      @"    if (e.key === 'Enter') {"
+      @"        var target = e.target;"
+      @"        var tagName = target.tagName ? target.tagName.toLowerCase() : '';"
+      @"        if (tagName === 'input' || tagName === 'textarea') {"
+      @"            var searchType = target.type === 'search' || target.placeholder.toLowerCase().indexOf('search') >= 0 || target.name.toLowerCase().indexOf('search') >= 0;"
+      @"            if (searchType) {"
+      @"                var value = target.value ? target.value.substring(0, 50) : '';"
+      @"                sendOperation('search', '搜索: ' + value, target);"
+      @"            }"
+      @"        }"
+      @"    }"
+      @"}, true);"
+      @""
+      @"// === 测试：脚本已加载 ==="
+      @"console.log('[QCTestKit] 操作捕获脚本已注入');"
+      @"// 立即发送一个测试消息来验证通信"
+      @"setTimeout(function() {"
+      @"    console.log('[QCTestKit] 发送测试消息...');"
+      @"    window.webkit.messageHandlers.userOperation.postMessage({"
+      @"        type: 'test',"
+      @"        name: '脚本注入测试',"
+      @"        element: 'script-test',"
+      @"        url: window.location.href,"
+      @"        timestamp: new Date().toISOString()"
+      @"    });"
+      @"}, 500);"
+      @""
+      @"})();";
+
+  WKUserScript *operationScript = [[WKUserScript alloc]
+        initWithSource:operationCaptureScript
+         injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+      forMainFrameOnly:YES];
+  [config.userContentController addUserScript:operationScript];
+  [config.userContentController addScriptMessageHandler:self name:@"userOperation"];
+  NSLog(@"[QCTestKit] 📝 注册 userOperation message handler");
+
+  // 添加一个简单的测试脚本，在文档开始时就注入
+  NSString *testScript =
+      @"console.log('[QCTestKit JS] 测试脚本注入成功');"
+      @"setTimeout(function() {"
+      @"  console.log('[QCTestKit JS] 准备发送测试消息...');"
+      @"  if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.userOperation) {"
+      @"    console.log('[QCTestKit JS] userOperation handler 存在');"
+      @"    window.webkit.messageHandlers.userOperation.postMessage({"
+      @"      type: 'test',"
+      @"      name: '测试消息',"
+      @"      element: 'test',"
+      @"      url: window.location.href,"
+      @"      timestamp: new Date().toISOString()"
+      @"    });"
+      @"    console.log('[QCTestKit JS] 测试消息已发送');"
+      @"  } else {"
+      @"    console.error('[QCTestKit JS] userOperation handler 不存在!');"
+      @"  }"
+      @"}, 1000);";
+
+  WKUserScript *simpleTestScript = [[WKUserScript alloc]
+        initWithSource:testScript
+         injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+      forMainFrameOnly:YES];
+  [config.userContentController addUserScript:simpleTestScript];
+  NSLog(@"[QCTestKit] 🧪 添加简单测试脚本");
+
   WKUserScript *perfScript = [[WKUserScript alloc]
         initWithSource:performanceScript
          injectionTime:WKUserScriptInjectionTimeAtDocumentStart
@@ -542,8 +697,28 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   [config.userContentController addScriptMessageHandler:self
                                                    name:@"resourceTiming"];
 
+  NSLog(@"[QCTestKit] 📋 已注册的 script message handlers: networkLog, userOperation, jsError, consoleLog, performanceData, resourceTiming");
+
   self.webView = [[WKWebView alloc] initWithFrame:self.webViewContainer.bounds
                                     configuration:config];
+
+  // 验证：在 WebView 创建后立即测试 message handler
+  NSLog(@"[QCTestKit] 🔍 WebView 已创建，准备测试 message handler...");
+
+  // 使用 evaluateJavaScript 测试 userOperation handler
+  NSString *testJS = @"window.webkit.messageHandlers.userOperation.postMessage({type:'nativeTest',name:'Native测试',element:'native',url:'test://test',timestamp:new Date().toISOString()});";
+  [self.webView evaluateJavaScript:testJS completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+    if (error) {
+      NSLog(@"[QCTestKit] ❌ evaluateJavaScript 测试失败: %@", error.localizedDescription);
+    } else {
+      NSLog(@"[QCTestKit] ✅ evaluateJavaScript 测试成功，应该会触发 message handler");
+    }
+  }];
+
+  // 设置 Safari User-Agent
+  self.webView.customUserAgent = @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+  NSLog(@"[QCTestKit] 📱 User-Agent 设置为 Safari");
+
   self.webView.navigationDelegate = self;
   self.webView.UIDelegate = self;
   self.webView.backgroundColor = [UIColor whiteColor];
@@ -659,16 +834,9 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
                                       action:@selector(refresh)];
   self.refreshButton.tintColor = buttonTintColor;
 
-  self.diagnosticButton =
-      [[UIBarButtonItem alloc] initWithTitle:@"📊 诊断"
-                                       style:UIBarButtonItemStylePlain
-                                      target:self
-                                      action:@selector(showDiagnostics)];
-  self.diagnosticButton.tintColor = buttonTintColor;
-
   self.toolbar.items = @[
     self.backButton, flexibleSpace, self.forwardButton, flexibleSpace,
-    self.refreshButton, flexibleSpace, self.diagnosticButton
+    self.refreshButton
   ];
 
   // 确保 tintColor 应用
@@ -809,217 +977,44 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   }
 }
 
-#pragma mark - Diagnostics
+#pragma mark - Network Capture
 
-- (void)resetDiagnosticData {
-  self.resourceRequests = [NSMutableDictionary dictionary];
-  self.jsErrors = [NSMutableArray array];
-  self.consoleLogs = [NSMutableArray array];
-  self.timingMetrics = [NSMutableDictionary dictionary];
-  self.totalBytesReceived = 0;
-  self.failedResourceCount = 0;
-  self.pageLoadStartTime = [NSDate date];
+- (void)showNetworkAnalysis {
+  QCWebDiagnosticViewController *networkVC = [[QCWebDiagnosticViewController alloc] init];
+  [self.navigationController pushViewController:networkVC animated:YES];
+}
 
+- (void)resetLoadingState {
   // 重置加载状态
   self.lastProgress = 0;
   self.progressJumpCount = 0;
   self.isLoadingFromCache = NO;
-  self.loadFailed = NO;
-  self.loadError = nil;
   [self.progressHistory removeAllObjects];
+  self.isLoadingComplete = NO;
 }
 
-- (void)showDiagnostics {
-  // 显示历史诊断列表
-  QCDiagnosticHistoryViewController *historyVC =
-      [[QCDiagnosticHistoryViewController alloc] init];
-  [self.navigationController pushViewController:historyVC animated:YES];
-}
-
-- (void)saveDiagnosticData:(NSDictionary *)data {
-  // 添加时间戳（转为字符串）
-  NSMutableDictionary *mutableData = [data mutableCopy];
-  NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-  formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-  mutableData[@"savedAt"] = [formatter stringFromDate:[NSDate date]];
-
-  // 获取历史记录
-  NSMutableArray *history = [[self loadDiagnosticHistory] mutableCopy];
-  if (!history) {
-    history = [NSMutableArray array];
-  }
-
-  // 添加新记录
-  [history insertObject:mutableData atIndex:0];
-
-  // 限制数量
-  NSInteger maxCount = [kQCBrowserMaxHistoryCount integerValue];
-  if (history.count > maxCount) {
-    [history
-        removeObjectsInRange:NSMakeRange(maxCount, history.count - maxCount)];
-  }
-
-  // 使用 JSON 序列化（更可靠）
-  NSError *error = nil;
-  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:history
-                                                     options:0
-                                                       error:&error];
-  if (error) {
-    NSLog(@"[QCTestKit] ❌ JSON编码失败: %@", error);
-    NSLog(@"[QCTestKit] 📋 数据内容: %@", history);
+- (void)startCaptureSession:(NSString *)url {
+  if (!self.captureManager.isCapturing) {
     return;
   }
-
-  if (jsonData) {
-    [[NSUserDefaults standardUserDefaults]
-        setObject:jsonData
-           forKey:kQCBrowserDiagnosticHistoryKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    NSLog(@"[QCTestKit] ✅ 诊断数据已保存，历史记录数: %lu",
-          (unsigned long)history.count);
-  }
+  self.currentSession = [self.captureManager createSessionWithUrl:url];
+  [self.pendingPackets removeAllObjects];
+  NSLog(@"[QCTestKit] 🌐 开始抓包会话: %@", url);
 }
 
-- (NSArray *)loadDiagnosticHistory {
-  NSData *jsonData = [[NSUserDefaults standardUserDefaults]
-      objectForKey:kQCBrowserDiagnosticHistoryKey];
-  if (jsonData) {
-    NSError *error = nil;
-    NSArray *history = [NSJSONSerialization JSONObjectWithData:jsonData
-                                                       options:0
-                                                         error:&error];
-    if (error) {
-      NSLog(@"[QCTestKit] ❌ JSON解码失败: %@", error);
-      return @[];
+- (void)endCaptureSession {
+  if (self.currentSession) {
+    // 更新会话的页面标题
+    if (self.webView.title) {
+      self.currentSession.pageTitle = self.webView.title;
     }
-    return history ?: @[];
+    [self.captureManager endCurrentSession];
+    self.currentSession = nil;
+    NSLog(@"[QCTestKit] ✅ 结束抓包会话");
   }
-  return @[];
 }
 
-- (void)clearDiagnosticHistory {
-  [[NSUserDefaults standardUserDefaults]
-      removeObjectForKey:kQCBrowserDiagnosticHistoryKey];
-  [[NSUserDefaults standardUserDefaults] synchronize];
-  NSLog(@"[QCTestKit] 🗑️ 诊断历史已清除");
-}
-
-- (void)autoSaveDiagnosticData {
-  if (!self.webView.URL) {
-    NSLog(@"[QCTestKit] ⚠️ 跳过保存：无 URL");
-    return;
-  }
-
-  NSLog(@"[QCTestKit] 💾 开始保存诊断数据...");
-
-  // 收集诊断数据 - 使用不可变字典以便序列化
-  NSMutableDictionary *diagnosticData = [NSMutableDictionary dictionary];
-
-  // 基本信息
-  diagnosticData[@"url"] = self.webView.URL.absoluteString;
-  diagnosticData[@"title"] = self.webView.title ?: @"Unknown";
-
-  // 加载状态信息
-  diagnosticData[@"loadStatus"] = self.loadFailed ? @"failed" : @"success";
-  diagnosticData[@"isLoadingFromCache"] = @(self.isLoadingFromCache);
-  diagnosticData[@"progressJumpCount"] = @(self.progressJumpCount);
-
-  // 如果加载失败，记录错误信息
-  if (self.loadFailed && self.loadError) {
-    diagnosticData[@"errorCode"] = @(self.loadError.code);
-    diagnosticData[@"errorDomain"] = self.loadError.domain ?: @"";
-    diagnosticData[@"errorMessage"] =
-        self.loadError.localizedDescription ?: @"";
-    diagnosticData[@"title"] = [NSString
-        stringWithFormat:@"加载失败: %@", self.loadError.localizedDescription
-                                              ?: @"Unknown Error"];
-  }
-
-  // 进度信息摘要
-  if (self.progressHistory.count > 0) {
-    float maxProgress =
-        [[self.progressHistory valueForKeyPath:@"@max.floatValue"] floatValue];
-    diagnosticData[@"maxProgress"] = @(maxProgress);
-    diagnosticData[@"progressSteps"] = @(self.progressHistory.count);
-  }
-
-  // 时间指标 - 逐个添加，避免添加整个可变字典
-  diagnosticData[@"dnsDuration"] = self.timingMetrics[@"dnsDuration"] ?: @0;
-  diagnosticData[@"tcpDuration"] = self.timingMetrics[@"tcpDuration"] ?: @0;
-  diagnosticData[@"sslDuration"] = self.timingMetrics[@"sslDuration"] ?: @0;
-  diagnosticData[@"ttfb"] = self.timingMetrics[@"ttfb"] ?: @0;
-  diagnosticData[@"downloadDuration"] =
-      self.timingMetrics[@"downloadDuration"] ?: @0;
-  diagnosticData[@"domLoadDuration"] =
-      self.timingMetrics[@"domLoadDuration"] ?: @0;
-  diagnosticData[@"totalLoadTime"] = self.timingMetrics[@"totalLoadTime"] ?: @0;
-
-  // 资源统计
-  diagnosticData[@"resourceCount"] = @(self.resourceRequests.count);
-  diagnosticData[@"failedResourceCount"] = @(self.failedResourceCount);
-  diagnosticData[@"jsErrorCount"] = @(self.jsErrors.count);
-  diagnosticData[@"totalBytes"] = @(self.totalBytesReceived);
-
-  NSLog(@"[QCTestKit] 📊 资源数: %lu, JS错误: %lu, 总流量: %lld, 状态: %@, "
-        @"缓存: %@",
-        (unsigned long)self.resourceRequests.count,
-        (unsigned long)self.jsErrors.count, self.totalBytesReceived,
-        self.loadFailed ? @"失败" : @"成功",
-        self.isLoadingFromCache ? @"是" : @"否");
-
-  // 资源请求列表
-  NSMutableArray *requestList = [NSMutableArray array];
-  for (NSString *url in self.resourceRequests) {
-    NSArray *requests = self.resourceRequests[url];
-    if (requests.count > 0) {
-      NSDictionary *lastRequest = requests.lastObject;
-      [requestList addObject:@{
-        @"url" : url,
-        @"method" : lastRequest[@"method"] ?: @"GET",
-        @"status" : lastRequest[@"status"] ?: @"200",
-        @"size" : lastRequest[@"size"] ?: @0,
-        @"duration" : lastRequest[@"duration"] ?: @0
-      }];
-    }
-  }
-  // 按耗时排序
-  [requestList sortUsingComparator:^NSComparisonResult(NSDictionary *obj1,
-                                                       NSDictionary *obj2) {
-    NSNumber *d1 = obj1[@"duration"] ?: @0;
-    NSNumber *d2 = obj2[@"duration"] ?: @0;
-    return [d2 compare:d1];
-  }];
-  diagnosticData[@"requests"] = [requestList copy]; // 不可变副本
-
-  // JS 错误 - 转为不可变
-  diagnosticData[@"jsErrors"] = [self.jsErrors copy];
-
-  // 控制台日志 - 转为不可变
-  NSArray *recentLogs =
-      self.consoleLogs.count > 50
-          ? [self.consoleLogs subarrayWithRange:NSMakeRange(0, 50)]
-          : self.consoleLogs;
-  diagnosticData[@"consoleLogs"] = [recentLogs copy];
-
-  // 保存诊断数据 - 转为不可变
-  [self saveDiagnosticData:[diagnosticData copy]];
-}
-
-// 保存失败诊断记录的便捷方法
-- (void)saveFailedDiagnostic {
-  if (!self.webView.URL && !self.loadError) {
-    return;
-  }
-
-  // 立即保存失败记录
-  [NSObject
-      cancelPreviousPerformRequestsWithTarget:self
-                                     selector:@selector(autoSaveDiagnosticData)
-                                       object:nil];
-  [self autoSaveDiagnosticData];
-}
-
-#pragma mark - Network Logging
+#pragma mark - WKScriptMessageHandler (网络抓包)
 
 - (void)logRequestStart:(NSURLRequest *)request {
   self.currentRequestStartTime = [NSDate date];
@@ -1132,6 +1127,9 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
+  // 调试：记录所有收到的消息
+  NSLog(@"[QCTestKit] 📨 收到脚本消息: name=%@, body=%@", message.name, message.body);
+
   if ([message.name isEqualToString:@"networkLog"]) {
     [self handleNetworkLog:message.body];
   } else if ([message.name isEqualToString:@"jsError"]) {
@@ -1142,6 +1140,8 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     [self handlePerformanceData:message.body];
   } else if ([message.name isEqualToString:@"resourceTiming"]) {
     [self handleResourceTiming:message.body];
+  } else if ([message.name isEqualToString:@"userOperation"]) {
+    [self handleUserOperation:message.body];
   }
 }
 
@@ -1172,17 +1172,18 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     NSLog(@"╚══════════════════════════════════════════════════════════════════"
           @"════════════");
 
-    // 保存到资源请求中
+    // 保存到资源请求中 - 简化：只记录日志，不保存数据
+    // 创建抓包记录
     NSString *url = body[@"url"];
-    if (url && !self.resourceRequests[url]) {
-      self.resourceRequests[url] = [NSMutableArray array];
+    NSString *reqId = body[@"id"];
+    if (url && reqId && self.currentSession && self.captureManager.isCapturing) {
+      QCNetworkPacket *packet = [self.captureManager createPacketWithUrl:url method:@"GET"];
+      if (packet) {
+        self.pendingPackets[reqId] = packet;
+        // 自动关联到当前操作
+        [self.captureManager associatePacketWithCurrentOperation:packet.packetId];
+      }
     }
-    [self.resourceRequests[url] addObject:@{
-      @"type" : body[@"type"],
-      @"method" : @"GET",
-      @"url" : url,
-      @"timestamp" : body[@"timestamp"]
-    }];
 
   } else if (body[@"responseId"]) {
     // fetch/xhr 响应
@@ -1193,7 +1194,6 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 
     if (body[@"error"]) {
       NSLog(@"[QCTestKit] ❌ 错误: %@", body[@"error"]);
-      self.failedResourceCount++;
     } else {
       NSLog(@"[QCTestKit] 📊 状态码: %@", body[@"status"]);
 
@@ -1216,6 +1216,20 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 
     NSLog(@"╚══════════════════════════════════════════════════════════════════"
           @"════════════");
+
+    // 更新抓包记录
+    NSString *respId = body[@"responseId"];
+    QCNetworkPacket *packet = self.pendingPackets[respId];
+    if (packet && self.captureManager.isCapturing) {
+      NSDictionary *responseInfo = @{
+        @"statusCode": body[@"status"] ?: @0,
+        @"statusText": @"",
+        @"headers": body[@"headers"] ?: @{},
+        @"body": body[@"body"] ?: @"",
+        @"bodySize": @([body[@"body"] length] ?: 0)
+      };
+      [self.captureManager updatePacket:packet.packetId withResponse:responseInfo];
+    }
   }
 }
 
@@ -1236,13 +1250,8 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   NSLog(@"╚════════════════════════════════════════════════════════════════════"
         @"══════════");
 
-  // 保存到错误列表
-  [self.jsErrors addObject:@{
-    @"message" : message,
-    @"file" : file,
-    @"line" : line,
-    @"stack" : error[@"stack"] ?: @""
-  }];
+  // 保存到错误列表 - 简化：只记录日志，不保存数据
+  // [self.jsErrors addObject:@{...}];
 }
 
 - (void)handleConsoleLog:(NSDictionary *)log {
@@ -1259,12 +1268,8 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
 
   NSLog(@"[QCTestKit] %@ [Console.%@] %@", emoji, level, message);
 
-  // 保存到控制台日志
-  [self.consoleLogs addObject:@{
-    @"level" : level,
-    @"message" : message,
-    @"timestamp" : log[@"timestamp"] ?: @""
-  }];
+  // 保存到控制台日志 - 简化：只记录日志，不保存数据
+  // [self.consoleLogs addObject:@{...}];
 }
 
 - (void)handlePerformanceData:(NSDictionary *)metrics {
@@ -1283,14 +1288,9 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   NSLog(@"╚════════════════════════════════════════════════════════════════════"
         @"══════════");
 
-  // 保存性能指标
-  self.timingMetrics[@"dnsDuration"] = metrics[@"dns"];
-  self.timingMetrics[@"tcpDuration"] = metrics[@"tcp"];
-  self.timingMetrics[@"sslDuration"] = metrics[@"ssl"];
-  self.timingMetrics[@"ttfb"] = metrics[@"ttfb"];
-  self.timingMetrics[@"downloadDuration"] = metrics[@"download"];
-  self.timingMetrics[@"domLoadDuration"] = metrics[@"domLoad"];
-  self.timingMetrics[@"totalLoadTime"] = metrics[@"total"];
+  // 保存性能指标 - 简化：只记录日志，不保存数据
+  // self.timingMetrics[@"dnsDuration"] = metrics[@"dns"];
+  // ...
 }
 
 - (void)handleResourceTiming:(NSDictionary *)resource {
@@ -1302,19 +1302,100 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   NSLog(@"[QCTestKit] 📦 资源 [%@] %@ | %.0fms | %lld bytes", type, name,
         [duration doubleValue], (long long)[size longLongValue]);
 
-  // 保存到资源请求
-  if (!self.resourceRequests[name]) {
-    self.resourceRequests[name] = [NSMutableArray array];
+  // 创建抓包记录
+  if (self.currentSession && self.captureManager.isCapturing) {
+    QCNetworkPacket *packet = [self.captureManager createPacketWithUrl:name method:@"GET"];
+    if (packet) {
+      packet.type = [self classifyRequestType:name];
+      packet.mimeType = type;
+      packet.duration = duration;
+      packet.responseBodySize = size;
+      packet.statusCode = 200;
+      // 自动关联到当前操作
+      [self.captureManager associatePacketWithCurrentOperation:packet.packetId];
+    }
   }
-  [self.resourceRequests[name] addObject:@{
-    @"type" : type,
-    @"url" : name,
-    @"duration" : duration,
-    @"size" : size,
-    @"status" : @200
-  }];
+}
 
-  self.totalBytesReceived += [size longLongValue];
+- (void)handleUserOperation:(NSDictionary *)operation {
+  NSString *type = operation[@"type"] ?: @"unknown";
+  NSString *name = operation[@"name"] ?: @"";
+  NSString *element = operation[@"element"] ?: @"";
+  NSString *url = operation[@"url"] ?: @"";
+
+  NSLog(@"[QCTestKit] ========== 收到用户操作消息 ==========");
+  NSLog(@"[QCTestKit] 👆 用户操作: %@ (类型: %@)", name, type);
+  NSLog(@"[QCTestKit] 📍 元素: %@", element);
+  NSLog(@"[QCTestKit] 🔗 URL: %@", url);
+  NSLog(@"[QCTestKit] ⏰ 时间戳: %@", operation[@"timestamp"]);
+  NSLog(@"[QCTestKit] 📊 当前会话: %@", self.currentSession ? @"存在" : @"不存在");
+  NSLog(@"[QCTestKit] 🔴 抓包开关: %@", self.captureManager.isCapturing ? @"开启" : @"关闭");
+
+  // 如果是测试消息，只记录日志不创建操作
+  if ([type isEqualToString:@"test"]) {
+    NSLog(@"[QCTestKit] ✅ 这是测试消息 - JavaScript 与 Native 通信正常！");
+    return;
+  }
+
+  // 创建操作记录
+  if (self.currentSession && self.captureManager.isCapturing) {
+    QCNetworkOperationType opType = [self parseOperationType:type];
+    NSLog(@"[QCTestKit] 🔧 开始创建操作，解析类型: %ld", (long)opType);
+
+    QCNetworkOperation *op = [self.captureManager createOperationWithType:opType
+                                                                      name:name
+                                                                       url:url];
+    if (op) {
+      op.elementInfo = element;
+      NSLog(@"[QCTestKit] 🎯 操作创建成功，ID: %@", op.operationId);
+    } else {
+      NSLog(@"[QCTestKit] ❌ 操作创建失败！");
+    }
+  } else {
+    NSLog(@"[QCTestKit] ⚠️ 无法创建操作: %@",
+          !self.currentSession ? @"当前会话不存在" : @"抓包已关闭");
+  }
+  NSLog(@"[QCTestKit] ========== 操作处理结束 ==========");
+}
+
+- (QCNetworkOperationType)parseOperationType:(NSString *)type {
+  if ([type isEqualToString:@"click"]) return QCNetworkOperationTypeClick;
+  if ([type isEqualToString:@"input"]) return QCNetworkOperationTypeInput;
+  if ([type isEqualToString:@"submit"]) return QCNetworkOperationTypeSubmit;
+  if ([type isEqualToString:@"scroll"]) return QCNetworkOperationTypeScroll;
+  if ([type isEqualToString:@"search"]) return QCNetworkOperationTypeSearch;
+  if ([type isEqualToString:@"pageLoad"]) return QCNetworkOperationTypePageLoad;
+  if ([type isEqualToString:@"navigation"]) return QCNetworkOperationTypeNavigation;
+  return QCNetworkOperationTypeUnknown;
+}
+
+// 资源类型分类（用于网络抓包）
+- (QCNetworkRequestType)classifyRequestType:(NSString *)url {
+  NSString *lowerUrl = [url lowercaseString];
+
+  if ([lowerUrl containsString:@".js"] || [lowerUrl containsString:@"javascript"]) {
+    return QCNetworkRequestTypeScript;
+  }
+  if ([lowerUrl containsString:@".css"]) {
+    return QCNetworkRequestTypeStylesheet;
+  }
+  if ([lowerUrl containsString:@".png"] || [lowerUrl containsString:@".jpg"] ||
+      [lowerUrl containsString:@".jpeg"] || [lowerUrl containsString:@".gif"] ||
+      [lowerUrl containsString:@".webp"] || [lowerUrl containsString:@".svg"] ||
+      [lowerUrl containsString:@".ico"]) {
+    return QCNetworkRequestTypeImage;
+  }
+  if ([lowerUrl containsString:@".woff"] || [lowerUrl containsString:@".woff2"] ||
+      [lowerUrl containsString:@".ttf"] || [lowerUrl containsString:@".eot"] ||
+      [lowerUrl containsString:@".otf"]) {
+    return QCNetworkRequestTypeFont;
+  }
+  if ([lowerUrl containsString:@".mp4"] || [lowerUrl containsString:@".webm"] ||
+      [lowerUrl containsString:@".ogg"] || [lowerUrl containsString:@".mp3"]) {
+    return QCNetworkRequestTypeMedia;
+  }
+
+  return QCNetworkRequestTypeOther;
 }
 
 #pragma mark - URLProtocol Logging (for main request)
@@ -1346,6 +1427,13 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   }
 
   if (url) {
+    // 立即更新地址栏显示用户输入的完整 URL
+    self.searchBar.text = url.absoluteString;
+
+    // 结束之前的抓包会话（会话将在 didCommitNavigation 中创建）
+    [self endCaptureSession];
+    self.lastNavigatedURL = nil; // 重置，让导航回调创建新会话
+
     if (self.useWKWebView) {
       NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
       [request setHTTPMethod:@"GET"];
@@ -1395,6 +1483,11 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     float progress = self.webView.estimatedProgress;
     BOOL isComplete = (progress == 1);
 
+    // 如果本次加载已完成且进度又变小了，说明是新的子资源加载，不处理
+    if (self.isLoadingComplete && progress < 1.0) {
+      return;
+    }
+
     // 记录进度历史
     [self.progressHistory addObject:@(progress)];
 
@@ -1428,6 +1521,8 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
       self.progressLabel.text =
           [NSString stringWithFormat:@"%@ %ld%%", statusText, (long)percent];
     } else {
+      // 标记本次加载完成
+      self.isLoadingComplete = YES;
       if (self.isLoadingFromCache) {
         self.progressLabel.text = @"缓存加载完成";
       } else {
@@ -1466,14 +1561,45 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
                         (void (^)(WKNavigationActionPolicy))decisionHandler {
   // 允许所有导航
   decisionHandler(WKNavigationActionPolicyAllow);
+
+  // 只更新地址栏显示，不创建新会话（在 didStartProvisionalNavigation 中处理）
+  NSURL *targetURL = navigationAction.request.URL;
+  if (targetURL && targetURL.absoluteString.length > 0) {
+    if (navigationAction.targetFrame && navigationAction.targetFrame.isMainFrame) {
+      self.searchBar.text = targetURL.absoluteString;
+    }
+  }
 }
 
 - (void)webView:(WKWebView *)webView
     didStartProvisionalNavigation:(WKNavigation *)navigation {
   [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
-  // 重置诊断数据
-  [self resetDiagnosticData];
+  // 重置加载状态
+  [self resetLoadingState];
+
+  // 标记页面正在加载
+  self.isPageLoading = YES;
+
+  // 结束之前的会话（如果有）
+  if (self.currentSession) {
+    [self endCaptureSession];
+  }
+
   NSLog(@"[QCTestKit] 🔄 开始加载页面: %@", webView.URL.absoluteString);
+}
+
+- (void)webView:(WKWebView *)webView
+    didCommitNavigation:(WKNavigation *)navigation {
+  // 此时 URL 已确定，创建抓包会话
+  if (webView.URL && webView.URL.absoluteString.length > 0) {
+    NSString *urlString = webView.URL.absoluteString;
+    // 只有当URL改变时才创建新会话
+    if (!self.lastNavigatedURL || ![self.lastNavigatedURL isEqualToString:urlString]) {
+      [self startCaptureSession:urlString];
+      self.lastNavigatedURL = urlString;
+      NSLog(@"[QCTestKit] 🌐 提交导航，创建抓包会话: %@", urlString);
+    }
+  }
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1481,25 +1607,32 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
   [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:NO];
   self.searchBar.text = webView.URL.absoluteString;
 
+  // 标记页面加载完成
+  self.isPageLoading = NO;
+
   if (webView.URL && webView.title) {
     [self.history addObject:@{
       @"title" : webView.title,
       @"url" : webView.URL.absoluteString,
       @"timestamp" : [NSDate date]
     }];
+    // 更新会话标题和最终URL
+    if (self.currentSession) {
+      self.currentSession.pageTitle = webView.title;
+      // 如果最终URL与创建会话时的URL不同，更新会话的URL
+      if (webView.URL.absoluteString &&
+          ![self.currentSession.mainUrl isEqualToString:webView.URL.absoluteString]) {
+        self.currentSession.mainUrl = webView.URL.absoluteString;
+        NSLog(@"[QCTestKit] 🔄 更新会话URL: %@ -> %@", self.currentSession.mainUrl, webView.URL.absoluteString);
+      }
+    }
   }
 
   NSLog(@"[QCTestKit] 🌐 页面导航完成: %@ - %@", webView.URL.absoluteString,
         webView.title);
 
-  // 延迟3秒后自动保存诊断数据（等待性能数据收集完成）
-  [NSObject
-      cancelPreviousPerformRequestsWithTarget:self
-                                     selector:@selector(autoSaveDiagnosticData)
-                                       object:nil];
-  [self performSelector:@selector(autoSaveDiagnosticData)
-             withObject:nil
-             afterDelay:3.0];
+  // 会话保持活跃，直到下一次导航开始时才结束（不自动结束）
+  // 这样可以记录页面内后续的所有网络请求
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1513,14 +1646,8 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     return;
   }
 
-  self.loadFailed = YES;
-  self.loadError = error;
-
   NSLog(@"[QCTestKit] ❌ 导航失败: %@ - %@", error.localizedDescription,
         webView.URL.absoluteString);
-
-  // 确保失败也被记录到诊断
-  [self saveFailedDiagnostic];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1534,13 +1661,7 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     return;
   }
 
-  self.loadFailed = YES;
-  self.loadError = error;
-
   NSLog(@"[QCTestKit] ❌ 临时导航失败: %@", error.localizedDescription);
-
-  // 确保失败也被记录到诊断
-  [self saveFailedDiagnostic];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1604,6 +1725,16 @@ static NSString *const kQCBrowserMaxHistoryCount = @"50"; // 最多保存50条�
     [self.webView removeObserver:self forKeyPath:@"estimatedProgress"];
     [self.webView removeObserver:self forKeyPath:@"canGoBack"];
     [self.webView removeObserver:self forKeyPath:@"canGoForward"];
+
+    // 移除 script message handlers
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"networkLog"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"userOperation"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"jsError"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"consoleLog"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"performanceData"];
+    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"resourceTiming"];
+
+    NSLog(@"[QCTestKit] 🧹 清理 script message handlers");
   }
 }
 

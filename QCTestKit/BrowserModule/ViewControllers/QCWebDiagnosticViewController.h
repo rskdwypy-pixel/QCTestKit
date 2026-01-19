@@ -9,9 +9,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// 网络分析页面
 @interface QCWebDiagnosticViewController : QCBaseViewController
-
-- (instancetype)initWithDiagnosticData:(NSDictionary *)data;
 
 @end
 
